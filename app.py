@@ -2,6 +2,7 @@ import streamlit as st
 import yt_dlp
 import os
 import subprocess
+import shutil
 import pandas as pd
 from datetime import datetime, timedelta
 
@@ -18,27 +19,57 @@ with tab1:
     st.subheader("YouTube Link ya Video Upload Karein")
     source_type = st.radio("Select Source:", ["YouTube Link", "Upload Video File"])
     
-    video_path = None
     if source_type == "YouTube Link":
         yt_url = st.text_input("Paste YouTube URL:")
+        
+        with st.expander("⚙️ Advanced: YouTube Bot Block Bypass (Cookies & Proxy)"):
+            st.caption("Agar YouTube cloud IP block kare, toh browser se cookies.txt export karke yahan upload karein:")
+            cookie_file = st.file_uploader("Upload cookies.txt (Optional)", type=["txt"])
+            custom_proxy = st.text_input("Proxy URL (Optional - e.g. http://user:pass@ip:port):")
+            if cookie_file:
+                with open("cookies.txt", "wb") as f:
+                    f.write(cookie_file.read())
+                st.success("✅ Cookies loaded!")
+
         if st.button("Download & Process Video") and yt_url:
-            with st.spinner("Downloading video..."):
+            with st.spinner("Bypassing YouTube filters & downloading video..."):
+                if os.path.exists("downloads/input_video.mp4"):
+                    os.remove("downloads/input_video.mp4")
+                
                 ydl_opts = {
-                    'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+                    'format': 'best[ext=mp4]/best',
                     'outtmpl': 'downloads/input_video.mp4',
-                    'overwrites': True
+                    'overwrites': True,
+                    'nocheckcertificate': True,
+                    'geo_bypass': True,
+                    'extractor_args': {
+                        'youtube': {
+                            'player_client': ['ios', 'android', 'mweb']
+                        }
+                    },
+                    'http_headers': {
+                        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1'
+                    }
                 }
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    ydl.download([yt_url])
-                video_path = "downloads/input_video.mp4"
-                st.success("Video Downloaded!")
+                
+                if os.path.exists("cookies.txt"):
+                    ydl_opts['cookiefile'] = 'cookies.txt'
+                if custom_proxy:
+                    ydl_opts['proxy'] = custom_proxy
+
+                try:
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        ydl.download([yt_url])
+                    st.success("✅ Video Successfully Downloaded!")
+                except Exception as e:
+                    st.error(f"❌ YouTube ne Cloud IP block kiya hai. Detail: {str(e)}")
+                    st.info("💡 Solution: Upar 'Upload Video File' option use karein, ya 'Advanced' tab mein cookies.txt upload karein.")
     else:
-        uploaded_file = st.file_uploader("Upload MP4 File", type=["mp4", "mov"])
+        uploaded_file = st.file_uploader("Upload MP4 File Directly from Phone", type=["mp4", "mov", "mkv"])
         if uploaded_file:
-            video_path = "downloads/input_video.mp4"
-            with open(video_path, "wb") as f:
+            with open("downloads/input_video.mp4", "wb") as f:
                 f.write(uploaded_file.read())
-            st.success("Video Uploaded!")
+            st.success("✅ Video Uploaded Ready for Clipping!")
 
     st.divider()
     col1, col2, col3 = st.columns(3)
@@ -52,15 +83,21 @@ with tab1:
     if st.button("🚀 Generate Bulk Clips"):
         if os.path.exists("downloads/input_video.mp4"):
             with st.spinner("FFmpeg se fast 9:16 clips kat rahi hain..."):
-                # Get video duration
-                cmd_dur = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", "downloads/input_video.mp4"]
+                # Clear old clips
+                for f in os.listdir("clips"):
+                    os.remove(os.path.join("clips", f))
+
+                cmd_dur = [
+                    "ffprobe", "-v", "error", "-show_entries", "format=duration",
+                    "-of", "default=noprint_wrappers=1:nokey=1", "downloads/input_video.mp4"
+                ]
                 total_duration = float(subprocess.check_output(cmd_dur).decode("utf-8").strip())
                 
                 count = 0
-                for start_time in range(0, int(total_duration) - clip_duration, clip_duration):
+                for start_time in range(0, max(1, int(total_duration) - clip_duration), clip_duration):
                     if count >= max_clips:
                         break
-                    out_file = f"clips/clip_{count+1}.mp4"
+                    out_file = f"clips/clip_{count+1:03d}.mp4"
                     vf_filter = "crop=ih*9/16:ih,scale=1080:1920" if crop_9_16 else "scale=1080:1920"
                     
                     cmd = [
@@ -70,20 +107,24 @@ with tab1:
                     ]
                     subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     count += 1
+                
+                shutil.make_archive("all_clips", 'zip', "clips")
                 st.success(f"✅ {count} Clips Ready ho gayi hain!")
         else:
             st.error("Pehle video download ya upload karein!")
 
-    # Show generated clips
     clip_files = sorted(os.listdir("clips"))
     if clip_files:
         st.write(f"Total Generated Clips: **{len(clip_files)}**")
+        if os.path.exists("all_clips.zip"):
+            with open("all_clips.zip", "rb") as fp:
+                st.download_button("📦 Download All Clips (ZIP)", fp, "4i_clips_bundle.zip", "application/zip")
         st.video(f"clips/{clip_files[0]}")
 
-# --- TAB 2: MULTI-ACCOUNT MANAGER (CSV FOR 100s OF ACCOUNTS) ---
+# --- TAB 2: MULTI-ACCOUNT MANAGER ---
 with tab2:
     st.subheader("Bulk Accounts Manager (Instagram, TikTok, YouTube)")
-    st.info("100s of accounts ek saath connect karne ke liye CSV upload karein (Columns: platform, username, password_or_token, proxy)")
+    st.info("100s of accounts ek saath connect karne ke liye CSV upload karein")
     
     sample_df = pd.DataFrame([
         {"platform": "Instagram", "username": "clip_page_01", "password_or_token": "pass123", "proxy": "http://user:pass@ip:port"},
@@ -127,4 +168,4 @@ with tab3:
                 })
             st.success("🚀 All Clips Mapped & Queued Across Accounts!")
             st.dataframe(pd.DataFrame(schedule_log))
-          
+            
