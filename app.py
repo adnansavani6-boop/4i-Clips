@@ -39,24 +39,77 @@ def duration(path):
     return float(r.stdout.strip())
 
 def download_video(url, cookies=None):
+    """
+    Cookies are optional. yt-dlp's current YouTube extractor chooses supported
+    clients automatically; forcing old Android/iOS clients can make 403s worse.
+    Smaller HTTP chunks can help with YouTube throttling, but cannot override
+    a server-side block on the Streamlit Cloud IP.
+    """
     for p in BASE.glob("source.*"):
         p.unlink(missing_ok=True)
-    out = BASE / "source.%(ext)s"
-    opts = {
-        "format": "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
-        "merge_output_format": "mp4",
-        "outtmpl": str(out),
-        "noplaylist": True,
-        "quiet": True,
-        "retries": 3,
-        "fragment_retries": 3,
-    }
-    if cookies:
-        opts["cookiefile"] = str(cookies)
-    with yt_dlp.YoutubeDL(opts) as y:
-        y.download([url])
-    files = list(BASE.glob("source.*"))
-    return files[0] if files else None
+
+    output_template = str(BASE / "source.%(ext)s")
+    attempts = [
+        {
+            "format": "best[ext=mp4]/best",
+            "http_chunk_size": 5 * 1024 * 1024,
+        },
+        {
+            "format": "bv*+ba/b",
+            "merge_output_format": "mp4",
+            "http_chunk_size": 5 * 1024 * 1024,
+        },
+    ]
+
+    last_error = None
+    for attempt_no, extra in enumerate(attempts, start=1):
+        opts = {
+            **extra,
+            "outtmpl": output_template,
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": False,
+            "retries": 5,
+            "fragment_retries": 5,
+            "extractor_retries": 3,
+            "file_access_retries": 3,
+            "socket_timeout": 30,
+            "continuedl": True,
+            "overwrites": True,
+        }
+        if cookies:
+            opts["cookiefile"] = str(cookies)
+
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.download([url])
+
+            files = [
+                p for p in BASE.glob("source.*")
+                if p.is_file() and p.stat().st_size > 10_000
+            ]
+            if files:
+                return max(files, key=lambda p: p.stat().st_size)
+
+        except Exception as exc:
+            last_error = exc
+            # Remove partial files before trying the next format strategy.
+            for p in BASE.glob("source.*"):
+                p.unlink(missing_ok=True)
+
+    if last_error:
+        message = str(last_error)
+        if "403" in message or "Forbidden" in message:
+            raise RuntimeError(
+                "YouTube returned HTTP 403 to the Streamlit Cloud server. "
+                "This can happen when YouTube blocks datacenter IPs or requires "
+                "a current PO Token. The app cannot reliably fix an IP-level "
+                "block with retries or a different format. Try again later, "
+                "or upload a video file that you are authorized to use."
+            ) from last_error
+        raise RuntimeError(f"yt-dlp download failed: {message}") from last_error
+
+    raise RuntimeError("Download finished without producing a video file.")
 
 def scene_points(src):
     # FFmpeg scene-change score. If unavailable, return empty list.
@@ -172,6 +225,12 @@ with tab1:
                         st.success("Video ready.")
                 except Exception as e:
                     st.error(f"Download failed: {e}")
+                    st.info(
+                        "Cookies are optional. If a public video still returns 403 "
+                        "from Streamlit Cloud, the server IP or YouTube PO-token "
+                        "requirements may be the cause. Use Upload video as a reliable "
+                        "fallback for videos you have permission to process."
+                    )
 
     else:
         up = st.file_uploader("Upload MP4/MOV/MKV/WebM",type=["mp4","mov","mkv","webm"])
