@@ -1,329 +1,345 @@
-import streamlit as st
-import yt_dlp
-import subprocess
 import shutil
+import subprocess
 import tempfile
-import json
-import csv
-import math
+from datetime import datetime, time, timedelta
 from pathlib import Path
 from urllib.parse import urlparse
 
-st.set_page_config(page_title="4i-Clips V2", page_icon="⚡", layout="wide")
+import pandas as pd
+import requests
+import streamlit as st
+import yt_dlp
+from yt_dlp.utils import DownloadError
 
-BASE = Path(st.session_state.get("workdir", tempfile.mkdtemp(prefix="4iclips_v2_")))
-st.session_state["workdir"] = str(BASE)
-CLIPS = BASE / "clips"
-CLIPS.mkdir(exist_ok=True)
+st.set_page_config(page_title="4i-Clips", page_icon="🎬", layout="wide")
 
-def run(cmd, timeout=None):
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+REQUIRED_COLS = ["platform", "username", "password_or_token"]
+MIN_TAIL_SECONDS = 5
+YTDLP_CLIENT_ATTEMPTS = [["tv"], ["web_safari"], ["mweb"], None]
 
-def youtube_url(url):
+
+# ---------------------------------------------------------------- helpers
+def secret(name, default=None):
+    # Read a Streamlit secret without crashing if no secrets file exists
     try:
-        h = (urlparse(url.strip()).hostname or "").lower()
-        return h == "youtu.be" or h.endswith("youtube.com") or h.endswith(".youtube.com")
+        return st.secrets.get(name, default)
     except Exception:
-        return False
+        return default
+
+
+def workdir() -> Path:
+    # Per-session scratch folder so users never overwrite each other
+    if "workdir" not in st.session_state:
+        st.session_state.workdir = tempfile.mkdtemp(prefix="4iclips_")
+    return Path(st.session_state.workdir)
+
+
+def clips_dir() -> Path:
+    d = workdir() / "clips"
+    d.mkdir(exist_ok=True)
+    return d
+
+
+def list_clips():
+    return sorted(clips_dir().glob("clip_*.mp4"))
+
+
+def clear_sources():
+    for p in workdir().glob("source.*"):
+        p.unlink(missing_ok=True)
+
 
 def reset_clips():
-    for p in CLIPS.glob("clip_*.mp4"):
+    for p in clips_dir().iterdir():
         p.unlink(missing_ok=True)
-    (BASE / "clips.zip").unlink(missing_ok=True)
+    (workdir() / "all_clips.zip").unlink(missing_ok=True)
 
-def duration(path):
-    r = run(["ffprobe","-v","error","-show_entries","format=duration",
-             "-of","default=noprint_wrappers=1:nokey=1",str(path)])
-    if r.returncode != 0:
-        raise RuntimeError(r.stderr[-1000:])
-    return float(r.stdout.strip())
 
-def download_video(url, cookies=None):
-    """
-    Cookies are optional. yt-dlp's current YouTube extractor chooses supported
-    clients automatically; forcing old Android/iOS clients can make 403s worse.
-    Smaller HTTP chunks can help with YouTube throttling, but cannot override
-    a server-side block on the Streamlit Cloud IP.
-    """
-    for p in BASE.glob("source.*"):
-        p.unlink(missing_ok=True)
+def set_source(path):
+    st.session_state.source = str(path)
+    reset_clips()
 
-    output_template = str(BASE / "source.%(ext)s")
-    attempts = [
-        {
-            "format": "best[ext=mp4]/best",
-            "http_chunk_size": 5 * 1024 * 1024,
-        },
-        {
-            "format": "bv*+ba/b",
-            "merge_output_format": "mp4",
-            "http_chunk_size": 5 * 1024 * 1024,
-        },
+
+def find_source(folder):
+    ok = [
+        p for p in folder.glob("source.*")
+        if p.suffix.lower() not in {".part", ".ytdl", ".tmp"} and p.stat().st_size > 10_000
     ]
+    return max(ok, key=lambda p: p.stat().st_size) if ok else None
 
-    last_error = None
-    for attempt_no, extra in enumerate(attempts, start=1):
+
+def is_youtube_url(url):
+    try:
+        host = (urlparse(url.strip()).hostname or "").lower()
+    except ValueError:
+        return False
+    return host.endswith("youtube.com") or host == "youtu.be" or host.endswith(".youtu.be")
+
+
+# ------------------------------------------- download: yt-dlp -> Cobalt
+def try_ytdlp(url, folder, log):
+    proxy = secret("YT_PROXY")
+    for clients in YTDLP_CLIENT_ATTEMPTS:
+        clear_sources()
         opts = {
-            **extra,
-            "outtmpl": output_template,
+            "format": "bv*[height<=1080]+ba/b[height<=1080]/b",
+            "merge_output_format": "mp4",
+            "outtmpl": str(folder / "source.%(ext)s"),
             "noplaylist": True,
             "quiet": True,
-            "no_warnings": False,
-            "retries": 5,
-            "fragment_retries": 5,
-            "extractor_retries": 3,
-            "file_access_retries": 3,
+            "no_warnings": True,
+            "retries": 3,
+            "fragment_retries": 3,
             "socket_timeout": 30,
-            "continuedl": True,
-            "overwrites": True,
+            "max_filesize": 2 * 1024**3,
         }
-        if cookies:
-            opts["cookiefile"] = str(cookies)
-
+        if proxy:
+            opts["proxy"] = proxy
+        if clients:
+            opts["extractor_args"] = {"youtube": {"player_client": clients}}
+        label = ",".join(clients) if clients else "default"
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 ydl.download([url])
+        except DownloadError as e:
+            log.append(f"yt-dlp [{label}]: {str(e)[:200]}")
+            continue
+        except Exception as e:
+            log.append(f"yt-dlp [{label}] unexpected: {str(e)[:200]}")
+            continue
+        found = find_source(folder)
+        if found:
+            return found
+        log.append(f"yt-dlp [{label}]: finished but no file was produced")
+    return None
 
-            files = [
-                p for p in BASE.glob("source.*")
-                if p.is_file() and p.stat().st_size > 10_000
-            ]
-            if files:
-                return max(files, key=lambda p: p.stat().st_size)
 
-        except Exception as exc:
-            last_error = exc
-            # Remove partial files before trying the next format strategy.
-            for p in BASE.glob("source.*"):
-                p.unlink(missing_ok=True)
+def try_cobalt(url, folder, log):
+    api = secret("COBALT_API_URL")
+    if not api:
+        log.append("Cobalt fallback not configured (COBALT_API_URL missing)")
+        return None
+    headers = {"Accept": "application/json", "Content-Type": "application/json"}
+    key = secret("COBALT_API_KEY")
+    if key:
+        headers["Authorization"] = f"Api-Key {key}"
+    try:
+        r = requests.post(api, json={"url": url, "videoQuality": "720"}, headers=headers, timeout=30)
+        data = r.json()
+        if data.get("status") not in ("tunnel", "redirect") or "url" not in data:
+            log.append(f"Cobalt: {str(data)[:200]}")
+            return None
+        clear_sources()
+        target = folder / "source.mp4"
+        with requests.get(data["url"], stream=True, timeout=60) as dl:
+            dl.raise_for_status()
+            with open(target, "wb") as f:
+                for chunk in dl.iter_content(chunk_size=1024 * 1024):
+                    f.write(chunk)
+        return find_source(folder)
+    except (requests.RequestException, ValueError) as e:
+        log.append(f"Cobalt: {str(e)[:200]}")
+        return None
 
-    if last_error:
-        message = str(last_error)
-        if "403" in message or "Forbidden" in message:
-            raise RuntimeError(
-                "YouTube returned HTTP 403 to the Streamlit Cloud server. "
-                "This can happen when YouTube blocks datacenter IPs or requires "
-                "a current PO Token. The app cannot reliably fix an IP-level "
-                "block with retries or a different format. Try again later, "
-                "or upload a video file that you are authorized to use."
-            ) from last_error
-        raise RuntimeError(f"yt-dlp download failed: {message}") from last_error
 
-    raise RuntimeError("Download finished without producing a video file.")
+def download_video(url, folder, log):
+    return try_ytdlp(url, folder, log) or try_cobalt(url, folder, log)
 
-def scene_points(src):
-    # FFmpeg scene-change score. If unavailable, return empty list.
-    vf = "select='gt(scene,0.35)',showinfo"
-    r = run(["ffmpeg","-hide_banner","-i",str(src),"-vf",vf,"-f","null","-"], timeout=180)
-    points = []
-    for line in r.stderr.splitlines():
-        if "pts_time:" in line:
-            try:
-                x = line.split("pts_time:",1)[1].split()[0]
-                points.append(float(x))
-            except Exception:
-                pass
-    return points
 
-def loudness_points(src):
-    # Detect louder sections using FFmpeg's volumedetect in 10-second windows.
-    # This is a lightweight heuristic, not a claim of semantic AI.
-    total = duration(src)
-    points = []
-    step = 10
-    for start in range(0, max(1, int(total)), step):
-        length = min(step, total-start)
-        r = run(["ffmpeg","-ss",str(start),"-t",str(length),"-i",str(src),
-                 "-af","volumedetect","-f","null","-"], timeout=30)
-        mean = None
-        for line in r.stderr.splitlines():
-            if "mean_volume:" in line:
-                try:
-                    mean = float(line.split("mean_volume:")[1].split("dB")[0].strip())
-                except Exception:
-                    pass
-        if mean is not None:
-            points.append((start, mean))
-    return points
+# ------------------------------------------------------ clipping (FFmpeg)
+def probe_duration(path):
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", path],
+        capture_output=True, text=True, check=True,
+    )
+    return float(out.stdout.strip())
 
-def smart_starts(src, clip_len, max_clips):
-    total = duration(src)
-    candidates = []
-    # Combine scene changes with loudness peaks.
-    for t in scene_points(src):
-        if 0 <= t <= max(0, total-clip_len):
-            candidates.append((t, 2.0))
-    loud = loudness_points(src)
-    if loud:
-        vals = [v for _,v in loud]
-        avg = sum(vals)/len(vals)
-        for t,v in loud:
-            if v >= avg + 4 and t <= max(0,total-clip_len):
-                candidates.append((float(t), 1.5))
 
-    # Always retain evenly spaced fallbacks.
-    if not candidates:
-        candidates = [(float(t),1.0) for t in range(0, max(1,int(total-clip_len)+1), clip_len)]
+def build_starts(total, clip_len, max_clips):
+    starts, t = [], 0
+    while t < total and len(starts) < max_clips:
+        if not starts or total - t >= MIN_TAIL_SECONDS:
+            starts.append(t)
+        t += clip_len
+    return starts
 
-    candidates.sort(key=lambda x: x[1], reverse=True)
-    chosen = []
-    min_gap = max(clip_len * 0.6, 8)
-    for t,_score in candidates:
-        if all(abs(t-c) >= min_gap for c in chosen):
-            chosen.append(t)
-        if len(chosen) >= max_clips:
-            break
-    chosen.sort()
-    return chosen
 
-def make_clip(src, dst, start, length, mode):
-    if mode == "crop":
-        vf = "crop=w='min(iw,ih*9/16)':h='min(ih,iw*16/9)',scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,setsar=1"
+def make_clip(src, dst, start, dur, vertical_crop):
+    if vertical_crop:
+        vf = "crop=w='min(iw,ih*9/16)':h='min(ih,iw*16/9)',scale=1080:1920,setsar=1"
     else:
-        vf = "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,setsar=1"
-    cmd = ["ffmpeg","-y","-ss",str(max(0,start)),"-i",str(src),
-           "-t",str(length),"-vf",vf,
-           "-c:v","libx264","-preset","veryfast","-crf","23",
-           "-pix_fmt","yuv420p","-c:a","aac","-b:a","128k",
-           "-movflags","+faststart",str(dst)]
-    r = run(cmd, timeout=300)
-    return r.returncode == 0 and dst.exists() and dst.stat().st_size > 1000
+        vf = ("scale=1080:1920:force_original_aspect_ratio=decrease,"
+              "pad=1080:1920:(ow-iw)/2:(oh-ih)/2,setsar=1")
+    cmd = [
+        "ffmpeg", "-y", "-ss", str(start), "-i", src, "-t", str(dur),
+        "-vf", vf, "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+        "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
+        "-movflags", "+faststart", str(dst),
+    ]
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    ok = res.returncode == 0 and dst.exists() and dst.stat().st_size > 1000
+    return ok, res.stderr[-300:]
 
-def zip_clips():
-    archive = BASE / "clips"
-    z = shutil.make_archive(str(BASE / "clips"), "zip", archive)
-    return Path(z)
 
-st.title("⚡ 4i-Clips V2")
-st.caption("Smart clip detection • 9:16 rendering • export queue")
+# --------------------------------------------------------------------- UI
+st.title("🎬 4i-Clips: Bulk AI Clipper & Multi-Account Scheduler")
+tab1, tab2, tab3 = st.tabs(["1. Generate Clips", "2. Manage Accounts", "3. Schedule & Queue"])
 
-if not (shutil.which("ffmpeg") and shutil.which("ffprobe")):
-    st.error("FFmpeg/FFprobe not found. Install packages.txt before running.")
-
-tab1, tab2, tab3 = st.tabs(["🎬 Smart Clipper","📋 Queue","⚙️ Settings"])
-
+# ------------------------------------------------------------------ TAB 1
 with tab1:
-    source = st.radio("Source",["YouTube URL","Upload video"],horizontal=True)
-    src = None
+    if not (shutil.which("ffmpeg") and shutil.which("ffprobe")):
+        st.error("FFmpeg not found. Add a file named packages.txt containing ffmpeg to the repo root and reboot the app.")
 
-    if source == "YouTube URL":
-        url = st.text_input("YouTube URL")
-        cookies = st.file_uploader("Optional cookies.txt",type=["txt"])
-        if st.button("⬇️ Download",type="primary"):
-            if not youtube_url(url):
-                st.error("Valid YouTube URL required.")
+    st.subheader("Source video")
+    source_type = st.radio("Source", ["YouTube link", "Upload video file"], horizontal=True)
+
+    if source_type == "YouTube link":
+        url = st.text_input("Paste YouTube URL")
+        st.caption("Only download content you own or have permission to reuse.")
+        if st.button("Download video", type="primary"):
+            if not is_youtube_url(url):
+                st.warning("Please paste a valid YouTube link.")
             else:
-                cookie_path = None
-                if cookies:
-                    cookie_path = BASE / "cookies.txt"
-                    cookie_path.write_bytes(cookies.getbuffer())
-                try:
-                    with st.spinner("Downloading..."):
-                        src = download_video(url,cookie_path)
-                    if src:
-                        st.session_state["source"] = str(src)
-                        st.success("Video ready.")
-                except Exception as e:
-                    st.error(f"Download failed: {e}")
-                    st.info(
-                        "Cookies are optional. If a public video still returns 403 "
-                        "from Streamlit Cloud, the server IP or YouTube PO-token "
-                        "requirements may be the cause. Use Upload video as a reliable "
-                        "fallback for videos you have permission to process."
-                    )
-
+                log = []
+                with st.spinner("Downloading... trying multiple methods if needed"):
+                    path = download_video(url.strip(), workdir(), log)
+                if path:
+                    set_source(path)
+                    st.success("✅ Video downloaded.")
+                else:
+                    st.error("YouTube is blocking downloads from this server for this video.")
+                    st.info("Quick fix: download the video on your phone/PC and use "
+                            "'Upload video file' above. Clipping works the same.")
+                    with st.expander("Technical details"):
+                        st.code("\n".join(log) or "No details captured")
     else:
-        up = st.file_uploader("Upload MP4/MOV/MKV/WebM",type=["mp4","mov","mkv","webm"])
-        if up:
-            p = BASE / ("source" + Path(up.name).suffix.lower())
-            p.write_bytes(up.getbuffer())
-            st.session_state["source"] = str(p)
-            st.success("Video ready.")
+        up = st.file_uploader("Upload video", type=["mp4", "mov", "mkv", "webm"])
+        if up and st.session_state.get("upload_sig") != (up.name, up.size):
+            clear_sources()
+            dest = workdir() / f"source{Path(up.name).suffix.lower()}"
+            with open(dest, "wb") as f:
+                f.write(up.getbuffer())
+            st.session_state.upload_sig = (up.name, up.size)
+            set_source(dest)
+            st.success("✅ Video uploaded.")
 
-    src = Path(st.session_state["source"]) if st.session_state.get("source") else None
+    src = st.session_state.get("source")
+    if src and Path(src).exists():
+        st.divider()
+        c1, c2, c3 = st.columns(3)
+        clip_len = c1.number_input("Clip length (seconds)", min_value=10, max_value=60, value=30)
+        max_clips = c2.number_input("Max clips", min_value=1, max_value=500, value=20)
+        crop_916 = c3.checkbox("Auto 9:16 crop (Reels/Shorts/TikTok)", value=True)
 
-    if src and src.exists():
-        st.video(str(src))
-        a,b,c = st.columns(3)
-        clip_len = a.slider("Clip length",10,60,30)
-        max_clips = b.slider("Maximum clips",1,50,10)
-        mode = c.selectbox("9:16 mode",["crop","fit"])
-
-        if st.button("🧠 Find Best Moments + Render",type="primary"):
+        if st.button("🚀 Generate clips", type="primary"):
             reset_clips()
             try:
-                with st.spinner("Analyzing scenes and audio..."):
-                    starts = smart_starts(src,clip_len,max_clips)
-                if not starts:
-                    st.error("No usable moments found.")
-                else:
-                    bar = st.progress(0)
-                    made = 0
-                    for i,start in enumerate(starts,1):
-                        dst = CLIPS / f"clip_{i:03d}.mp4"
-                        if make_clip(src,dst,start,clip_len,mode):
-                            made += 1
-                        bar.progress(i/len(starts))
-                    zip_clips()
-                    st.success(f"Created {made} clips.")
-            except Exception as e:
-                st.error(f"Processing error: {e}")
+                total = probe_duration(src)
+            except (subprocess.CalledProcessError, ValueError):
+                total = None
+                st.error("Couldn't read this video file. Try another file.")
+            if total:
+                starts = build_starts(total, int(clip_len), int(max_clips))
+                bar = st.progress(0.0, text="Cutting clips...")
+                failed = []
+                for i, start in enumerate(starts, 1):
+                    ok, err = make_clip(src, clips_dir() / f"clip_{i:03d}.mp4", start, int(clip_len), crop_916)
+                    if not ok:
+                        failed.append((i, err))
+                    bar.progress(i / len(starts), text=f"Cutting clip {i}/{len(starts)}")
+                bar.empty()
+                if list_clips():
+                    shutil.make_archive(str(workdir() / "all_clips"), "zip", clips_dir())
+                    st.success(f"✅ {len(list_clips())} clips ready.")
+                if failed:
+                    st.warning(f"{len(failed)} clip(s) failed to render.")
+                    with st.expander("FFmpeg errors"):
+                        st.code("\n\n".join(f"clip {i}: {e}" for i, e in failed))
 
-    clips = sorted(CLIPS.glob("clip_*.mp4"))
+    clips = list_clips()
+    zip_path = workdir() / "all_clips.zip"
     if clips:
-        st.write(f"**{len(clips)} clips ready**")
-        st.download_button("📦 Download ZIP",(BASE/"clips.zip").read_bytes(),
-                           "4i_clips_v2.zip","application/zip")
-        for p in clips[:6]:
-            with st.expander(p.name):
-                st.video(str(p))
+        st.write(f"Generated clips: **{len(clips)}**")
+        if zip_path.exists():
+            with open(zip_path, "rb") as fp:
+                st.download_button("📦 Download all clips (ZIP)", fp, "4i_clips_bundle.zip", "application/zip")
+        st.video(str(clips[0]))
 
+# ------------------------------------------------------------------ TAB 2
 with tab2:
-    st.subheader("Queue Builder")
-    account_csv = st.file_uploader("Upload accounts CSV",type=["csv"])
-    if account_csv:
-        import pandas as pd
-        df = pd.read_csv(account_csv,dtype=str).fillna("")
-        required = {"platform","username"}
-        missing = required - set(c.strip().lower() for c in df.columns)
-        if missing:
-            st.error(f"Missing columns: {', '.join(sorted(missing))}")
-        else:
+    st.subheader("Accounts (Instagram, TikTok, YouTube)")
+    template = pd.DataFrame([
+        {"platform": "Instagram", "username": "clip_page_01", "password_or_token": "ACCESS_TOKEN", "proxy": ""},
+        {"platform": "TikTok", "username": "tiktok_clips_01", "password_or_token": "ACCESS_TOKEN", "proxy": ""},
+    ])
+    st.download_button("📥 Download CSV template", template.to_csv(index=False), "accounts_template.csv", "text/csv")
+    st.caption("Use official API/OAuth tokens instead of account passwords. Credentials stay in this "
+               "browser session only and are never written to disk.")
+
+    acc_file = st.file_uploader("Upload accounts CSV", type=["csv"])
+    if acc_file:
+        try:
+            df = pd.read_csv(acc_file, dtype=str).fillna("")
             df.columns = [c.strip().lower() for c in df.columns]
-            st.session_state["accounts"] = df
-            st.success(f"{len(df)} accounts loaded.")
-
-    clips = sorted(CLIPS.glob("clip_*.mp4"))
-    accounts = st.session_state.get("accounts")
-    if accounts is not None and len(accounts) and clips:
-        distribution = st.selectbox("Distribution",[
-            "Every clip to every account",
-            "Round-robin clips across accounts"
-        ])
-        if st.button("Build Queue",type="primary"):
-            rows = []
-            if distribution.startswith("Every"):
-                for clip in clips:
-                    for _,a in accounts.iterrows():
-                        rows.append({"clip":clip.name,"platform":a["platform"],
-                                     "account":a["username"],"status":"queued"})
+        except Exception as e:
+            st.error(f"Couldn't read that CSV: {e}")
+        else:
+            missing = [c for c in REQUIRED_COLS if c not in df.columns]
+            if missing:
+                st.error(f"Missing column(s): {', '.join(missing)}")
             else:
-                for i,clip in enumerate(clips):
-                    a = accounts.iloc[i % len(accounts)]
-                    rows.append({"clip":clip.name,"platform":a["platform"],
-                                 "account":a["username"],"status":"queued"})
-            st.session_state["queue"] = rows
+                if "proxy" not in df.columns:
+                    df["proxy"] = ""
+                st.session_state.accounts = df[REQUIRED_COLS + ["proxy"]].reset_index(drop=True)
 
-    if st.session_state.get("queue"):
-        import pandas as pd
-        q = pd.DataFrame(st.session_state["queue"])
-        st.dataframe(q,use_container_width=True)
-        st.download_button("Download queue CSV",q.to_csv(index=False),
-                           "4i_queue.csv","text/csv")
+    accounts = st.session_state.get("accounts")
+    if accounts is not None and len(accounts):
+        st.success(f"{len(accounts)} accounts loaded.")
+        masked = accounts.copy()
+        masked["password_or_token"] = "••••••"
+        masked["proxy"] = masked["proxy"].apply(lambda p: "set" if p else "")
+        st.dataframe(masked)
 
+# ------------------------------------------------------------------ TAB 3
 with tab3:
-    st.subheader("Settings")
-    st.info("This V2 keeps platform credentials out of the generated queue. Connect official platform APIs/OAuth in the uploader module before enabling automatic publishing.")
-    st.write("FFmpeg:", "OK" if shutil.which("ffmpeg") else "Missing")
-    st.write("FFprobe:", "OK" if shutil.which("ffprobe") else "Missing")
-    st.write("Working directory:", str(BASE))
+    st.subheader("Distribute clips across accounts")
+    st.caption("This builds the posting queue. Actual publishing needs each platform's official API "
+               "connected to the queue below.")
+
+    caption = st.text_area("Default caption & hashtags", "Wait for the end! 🔥 #viral #shorts #reels #fyp")
+    c1, c2, c3 = st.columns(3)
+    interval = c1.number_input("Minutes between posting rounds", min_value=5, value=30)
+    start_date = c2.date_input("Start date")
+    start_clock = c3.time_input("Start time", value=time(9, 0))
+    st.caption("Times are used exactly as entered (no timezone conversion).")
+
+    if st.button("📅 Build schedule", type="primary"):
+        accts = st.session_state.get("accounts")
+        clips = list_clips()
+        if accts is None or not len(accts):
+            st.error("Upload an accounts CSV in Tab 2 first.")
+        elif not clips:
+            st.error("Generate clips in Tab 1 first.")
+        else:
+            start_dt = datetime.combine(start_date, start_clock)
+            n = len(accts)
+            rows = []
+            for idx, clip in enumerate(clips):
+                acc = accts.iloc[idx % n]
+                when = start_dt + timedelta(minutes=int(interval) * (idx // n))
+                rows.append({
+                    "Clip": clip.name,
+                    "Platform": acc["platform"],
+                    "Account": acc["username"],
+                    "Scheduled time": when.strftime("%Y-%m-%d %H:%M"),
+                    "Caption": caption,
+                    "Status": "Queued",
+                })
+            st.session_state.schedule = pd.DataFrame(rows)
+            st.success(f"🚀 {len(rows)} posts queued across {n} accounts.")
+
+    schedule = st.session_state.get("schedule")
+    if schedule is not None:
+        st.dataframe(schedule)
+        st.download_button("📥 Download schedule CSV", schedule.to_csv(index=False), "schedule.csv", "text/csv")
