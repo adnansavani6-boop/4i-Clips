@@ -4,6 +4,7 @@ import os
 import subprocess
 import shutil
 import pandas as pd
+import requests
 from datetime import datetime, timedelta
 
 st.set_page_config(page_title="4i-Clips AI & Auto-Uploader", layout="wide")
@@ -19,71 +20,91 @@ with tab1:
     st.subheader("YouTube Link ya Video Upload Karein")
     source_type = st.radio("Select Source:", ["YouTube Link", "Upload Video File"])
     
+    video_ready = False
     if source_type == "YouTube Link":
         yt_url = st.text_input("Paste YouTube URL:")
         
-        with st.expander("⚙️ Advanced: YouTube Bot Block Bypass (Cookies & Proxy)"):
-            st.caption("Agar YouTube cloud IP block kare, toh browser se cookies.txt export karke yahan upload karein:")
-            cookie_file = st.file_uploader("Upload cookies.txt (Optional)", type=["txt"])
-            custom_proxy = st.text_input("Proxy URL (Optional - e.g. http://user:pass@ip:port):")
-            if cookie_file:
-                with open("cookies.txt", "wb") as f:
-                    f.write(cookie_file.read())
-                st.success("✅ Cookies loaded!")
-
         if st.button("Download & Process Video") and yt_url:
-            with st.spinner("Bypassing YouTube filters & downloading video..."):
+            with st.spinner("Bypassing YouTube cloud block automatically..."):
                 if os.path.exists("downloads/input_video.mp4"):
                     os.remove("downloads/input_video.mp4")
                 
-                ydl_opts = {
-                    'format': 'best[ext=mp4]/best',
-                    'outtmpl': 'downloads/input_video.mp4',
-                    'overwrites': True,
-                    'nocheckcertificate': True,
-                    'geo_bypass': True,
-                    'extractor_args': {
-                        'youtube': {
-                            'player_client': ['ios', 'android', 'mweb']
-                        }
+                # Method 1: Advanced yt-dlp with aggressive mobile client spoofing
+                success = False
+                ydl_opts_list = [
+                    {
+                        'format': 'best[ext=mp4]/best',
+                        'outtmpl': 'downloads/input_video.mp4',
+                        'overwrites': True,
+                        'nocheckcertificate': True,
+                        'geo_bypass': True,
+                        'extractor_args': {'youtube': {'player_client': ['android', 'ios']}},
+                        'http_headers': {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
                     },
-                    'http_headers': {
-                        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1'
+                    {
+                        'format': 'best',
+                        'outtmpl': 'downloads/input_video.mp4',
+                        'overwrites': True,
+                        'extractor_args': {'youtube': {'player_client': ['mweb', 'web']}}
                     }
-                }
+                ]
                 
-                if os.path.exists("cookies.txt"):
-                    ydl_opts['cookiefile'] = 'cookies.txt'
-                if custom_proxy:
-                    ydl_opts['proxy'] = custom_proxy
+                for opts in ydl_opts_list:
+                    try:
+                        with yt_dlp.YoutubeDL(opts) as ydl:
+                            ydl.download([yt_url])
+                        if os.path.exists("downloads/input_video.mp4") and os.path.getsize("downloads/input_video.mp4") > 1000:
+                            success = True
+                            break
+                    except Exception:
+                        continue
+                
+                # Method 2: Fallback to public API extractors if yt-dlp fails
+                if not success:
+                    try:
+                        st.info("🔄 Trying alternative server bridge to bypass 403...")
+                        api_url = f"https://co.wuk.sh/api/json"
+                        headers = {"Accept": "application/json", "Content-Type": "application/json"}
+                        data = {"url": yt_url, "vQuality": "720"}
+                        res = requests.post(api_url, json=data, headers=headers).json()
+                        
+                        if "url" in res:
+                            dl_link = res["url"]
+                            r = requests.get(dl_link, stream=True)
+                            with open("downloads/input_video.mp4", "wb") as f:
+                                for chunk in r.iter_content(chunk_size=1024):
+                                    if chunk:
+                                        f.write(chunk)
+                            success = True
+                    except Exception as e:
+                        pass
 
-                try:
-                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                        ydl.download([yt_url])
-                    st.success("✅ Video Successfully Downloaded!")
-                except Exception as e:
-                    st.error(f"❌ YouTube ne Cloud IP block kiya hai. Detail: {str(e)}")
-                    st.info("💡 Solution: Upar 'Upload Video File' option use karein, ya 'Advanced' tab mein cookies.txt upload karein.")
+                if success and os.path.exists("downloads/input_video.mp4"):
+                    st.success("✅ Video Successfully Downloaded & Bypassed!")
+                    video_ready = True
+                else:
+                    st.error("❌ YouTube ne is video ko poori tarah block kiya hai.")
+                    st.info("💡 Quick Fix: Kisi bhi free downloader website se video phone mein download karke niche 'Upload Video File' option se daal dein, instant clips ban jayengi!")
     else:
         uploaded_file = st.file_uploader("Upload MP4 File Directly from Phone", type=["mp4", "mov", "mkv"])
         if uploaded_file:
             with open("downloads/input_video.mp4", "wb") as f:
                 f.write(uploaded_file.read())
             st.success("✅ Video Uploaded Ready for Clipping!")
+            video_ready = True
 
-    st.divider()
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        clip_duration = st.number_input("Clip Duration (Seconds)", min_value=10, max_value=60, value=30)
-    with col2:
-        max_clips = st.number_input("Kitni Clips Banani Hai?", min_value=1, max_value=500, value=20)
-    with col3:
-        crop_9_16 = st.checkbox("Auto 9:16 Vertical Crop (Reels/Shorts/TikTok)", value=True)
+    if os.path.exists("downloads/input_video.mp4"):
+        st.divider()
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            clip_duration = st.number_input("Clip Duration (Seconds)", min_value=10, max_value=60, value=30)
+        with col2:
+            max_clips = st.number_input("Kitni Clips Banani Hai?", min_value=1, max_value=500, value=20)
+        with col3:
+            crop_9_16 = st.checkbox("Auto 9:16 Vertical Crop (Reels/Shorts)", value=True)
 
-    if st.button("🚀 Generate Bulk Clips"):
-        if os.path.exists("downloads/input_video.mp4"):
+        if st.button("🚀 Generate Bulk Clips"):
             with st.spinner("FFmpeg se fast 9:16 clips kat rahi hain..."):
-                # Clear old clips
                 for f in os.listdir("clips"):
                     os.remove(os.path.join("clips", f))
 
@@ -110,8 +131,6 @@ with tab1:
                 
                 shutil.make_archive("all_clips", 'zip', "clips")
                 st.success(f"✅ {count} Clips Ready ho gayi hain!")
-        else:
-            st.error("Pehle video download ya upload karein!")
 
     clip_files = sorted(os.listdir("clips"))
     if clip_files:
@@ -124,12 +143,9 @@ with tab1:
 # --- TAB 2: MULTI-ACCOUNT MANAGER ---
 with tab2:
     st.subheader("Bulk Accounts Manager (Instagram, TikTok, YouTube)")
-    st.info("100s of accounts ek saath connect karne ke liye CSV upload karein")
-    
     sample_df = pd.DataFrame([
         {"platform": "Instagram", "username": "clip_page_01", "password_or_token": "pass123", "proxy": "http://user:pass@ip:port"},
-        {"platform": "TikTok", "username": "tiktok_clips_01", "password_or_token": "session_id_token", "proxy": "http://user:pass@ip:port"},
-        {"platform": "YouTube", "username": "yt_shorts_01", "password_or_token": "oauth_refresh_token", "proxy": ""}
+        {"platform": "TikTok", "username": "tiktok_clips_01", "password_or_token": "session_id_token", "proxy": "http://user:pass@ip:port"}
     ])
     st.download_button("📥 Download Sample Accounts CSV Template", sample_df.to_csv(index=False), "accounts_template.csv", "text/csv")
     
@@ -163,7 +179,6 @@ with tab3:
                     "Platform": acc["platform"],
                     "Account": acc["username"],
                     "Scheduled Time": post_time.strftime("%Y-%m-%d %H:%M"),
-                    "Proxy Used": acc.get("proxy", "None"),
                     "Status": "Queued"
                 })
             st.success("🚀 All Clips Mapped & Queued Across Accounts!")
