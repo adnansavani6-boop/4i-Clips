@@ -1,9 +1,4 @@
-"""4i-Clips: AI video clipper + multi-account scheduler (Streamlit).
-
-Optional secrets (Streamlit Cloud -> App settings -> Secrets):
-    YT_PROXY        = "http://user:pass@host:port"   # residential proxy, most reliable fix for 403s
-    COBALT_API_URL  = "https://your-cobalt-host/"    # self-hosted Cobalt v10 API (fallback)
-    COBALT_API_KEY  = "..."                          # only if your Cobalt instance needs one
+ 
 """
 import shutil
 import subprocess
@@ -256,4 +251,108 @@ with tab1:
                 total = probe_duration(src)
             except (subprocess.CalledProcessError, ValueError):
                 total = None
-                st.error("Couldn't read thi
+                st.error("Couldn't read this video file. Try another file.")
+            if total:
+                starts = build_starts(total, int(clip_len), int(max_clips))
+                bar = st.progress(0.0, text="Cutting clips…")
+                failed = []
+                for i, start in enumerate(starts, 1):
+                    ok, err = make_clip(src, clips_dir() / f"clip_{i:03d}.mp4", start, int(clip_len), crop_916)
+                    if not ok:
+                        failed.append((i, err))
+                    bar.progress(i / len(starts), text=f"Cutting clip {i}/{len(starts)}")
+                bar.empty()
+                if list_clips():
+                    shutil.make_archive(str(workdir() / "all_clips"), "zip", clips_dir())
+                    st.success(f"✅ {len(list_clips())} clips ready.")
+                if failed:
+                    st.warning(f"{len(failed)} clip(s) failed to render.")
+                    with st.expander("FFmpeg errors"):
+                        st.code("\n\n".join(f"clip {i}: {e}" for i, e in failed))
+
+    clips = list_clips()
+    zip_path = workdir() / "all_clips.zip"
+    if clips:
+        st.write(f"Generated clips: **{len(clips)}**")
+        if zip_path.exists():
+            with open(zip_path, "rb") as fp:
+                st.download_button("📦 Download all clips (ZIP)", fp, "4i_clips_bundle.zip", "application/zip")
+        st.video(str(clips[0]))
+
+# --- TAB 2 -------------------------------------------------------------------
+with tab2:
+    st.subheader("Accounts (Instagram, TikTok, YouTube)")
+    template = pd.DataFrame([
+        {"platform": "Instagram", "username": "clip_page_01", "password_or_token": "ACCESS_TOKEN", "proxy": ""},
+        {"platform": "TikTok", "username": "tiktok_clips_01", "password_or_token": "ACCESS_TOKEN", "proxy": ""},
+    ])
+    st.download_button("📥 Download CSV template", template.to_csv(index=False), "accounts_template.csv", "text/csv")
+    st.caption("Use official API/OAuth tokens instead of account passwords. Credentials stay in this browser "
+               "session only and are never written to disk.")
+
+    acc_file = st.file_uploader("Upload accounts CSV", type=["csv"])
+    if acc_file:
+        try:
+            df = pd.read_csv(acc_file, dtype=str).fillna("")
+            df.columns = [c.strip().lower() for c in df.columns]
+        except Exception as e:
+            st.error(f"Couldn't read that CSV: {e}")
+        else:
+            missing = [c for c in REQUIRED_COLS if c not in df.columns]
+            if missing:
+                st.error(f"Missing column(s): {', '.join(missing)}")
+            else:
+                if "proxy" not in df.columns:
+                    df["proxy"] = ""
+                st.session_state.accounts = df[REQUIRED_COLS + ["proxy"]].reset_index(drop=True)
+
+    accounts = st.session_state.get("accounts")
+    if accounts is not None and len(accounts):
+        st.success(f"{len(accounts)} accounts loaded.")
+        masked = accounts.copy()
+        masked["password_or_token"] = "••••••"
+        masked["proxy"] = masked["proxy"].apply(lambda p: "set" if p else "")
+        st.dataframe(masked)
+
+# --- TAB 3 -------------------------------------------------------------------
+with tab3:
+    st.subheader("Distribute clips across accounts")
+    st.caption("This builds the posting queue. Actual publishing needs each platform's official API "
+               "connected to the queue below.")
+
+    caption = st.text_area("Default caption & hashtags", "Wait for the end! 🔥 #viral #shorts #reels #fyp")
+    c1, c2, c3 = st.columns(3)
+    interval = c1.number_input("Minutes between posting rounds", min_value=5, value=30)
+    start_date = c2.date_input("Start date")
+    start_clock = c3.time_input("Start time", value=time(9, 0))
+    st.caption("Times are used exactly as entered (no timezone conversion).")
+
+    if st.button("📅 Build schedule", type="primary"):
+        accts = st.session_state.get("accounts")
+        clips = list_clips()
+        if accts is None or not len(accts):
+            st.error("Upload an accounts CSV in Tab 2 first.")
+        elif not clips:
+            st.error("Generate clips in Tab 1 first.")
+        else:
+            start_dt = datetime.combine(start_date, start_clock)
+            n = len(accts)
+            rows = []
+            for idx, clip in enumerate(clips):
+                acc = accts.iloc[idx % n]
+                when = start_dt + timedelta(minutes=int(interval) * (idx // n))
+                rows.append({
+                    "Clip": clip.name,
+                    "Platform": acc["platform"],
+                    "Account": acc["username"],
+                    "Scheduled time": when.strftime("%Y-%m-%d %H:%M"),
+                    "Caption": caption,
+                    "Status": "Queued",
+                })
+            st.session_state.schedule = pd.DataFrame(rows)
+            st.success(f"🚀 {len(rows)} posts queued across {n} accounts.")
+
+    schedule = st.session_state.get("schedule")
+    if schedule is not None:
+        st.dataframe(schedule)
+        st.download_button("📥 Download schedule CSV", schedule.to_csv(index=False), "schedule.csv", "text/csv")
